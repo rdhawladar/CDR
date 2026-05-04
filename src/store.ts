@@ -27,8 +27,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status, next_attempt_at);
-CREATE INDEX IF NOT EXISTS deliveries_lease ON deliveries(status, lease_expires_at);
 `;
+// Note: the `deliveries_lease` index is created inside migrate() instead of
+// SCHEMA, because on a legacy DB SCHEMA runs before the column has been added.
 
 type SubscriberRow = {
   id: string;
@@ -87,7 +88,10 @@ export class Store {
 
   /**
    * Idempotent forward migration. SQLite's ALTER TABLE ADD COLUMN is itself
-   * non-idempotent, so we only fire it when the column is missing.
+   * non-idempotent, so we only fire it when the column is missing. The index
+   * creation runs unconditionally on every open — it's IF NOT EXISTS — so
+   * fresh DBs (which got the column from SCHEMA) and migrated legacy DBs
+   * both end up with the same indices.
    */
   private migrate(): void {
     const cols = this.db.prepare(`PRAGMA table_info(deliveries)`).all() as Array<{
@@ -95,10 +99,10 @@ export class Store {
     }>;
     if (!cols.some((c) => c.name === 'lease_expires_at')) {
       this.db.exec(`ALTER TABLE deliveries ADD COLUMN lease_expires_at INTEGER`);
-      this.db.exec(
-        `CREATE INDEX IF NOT EXISTS deliveries_lease ON deliveries(status, lease_expires_at)`,
-      );
     }
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS deliveries_lease ON deliveries(status, lease_expires_at)`,
+    );
   }
 
   close(): void {

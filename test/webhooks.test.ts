@@ -330,4 +330,132 @@ describe('createWebhooks', () => {
       }),
     ).toThrow(/leaseMs.*must be greater than requestTimeoutMs/);
   });
+
+  it('marks 4xx failures dead on the first attempt without retrying', async () => {
+    await startServer(() => ({ status: 400, body: 'malformed payload' }));
+    webhooks = createWebhooks({
+      dbPath: join(tmpDir, 'w.db'),
+      signingSecret: 'shh',
+      maxAttempts: 8,
+      baseRetryDelayMs: 10,
+      maxRetryDelayMs: 30,
+      pollIntervalMs: 20,
+    });
+    await webhooks.register('order.created', `http://127.0.0.1:${port}/hook`);
+    const { deliveryIds } = await webhooks.emit('order.created', { orderId: 1 });
+
+    // Wait for the row to land in 'dead'.
+    await waitFor(async () => (await webhooks!.listDead()).length >= 1, 2_000);
+    // Give a moment for any straggler retries that shouldn't happen.
+    await new Promise((r) => setTimeout(r, 200));
+
+    // The receiver should have been hit exactly once — no retries on 4xx.
+    expect(received).toHaveLength(1);
+
+    const dead = await webhooks.listDead();
+    expect(dead).toHaveLength(1);
+    expect(dead[0]!.id).toBe(deliveryIds[0]!);
+    expect(dead[0]!.attempts).toBe(1);
+    expect(dead[0]!.lastError).toMatch(/HTTP 400/);
+  });
+
+  it('still retries 408 and 429 (transient 4xx)', async () => {
+    let attemptCount = 0;
+    await startServer(() => {
+      attemptCount += 1;
+      // 408 first, then 429, then succeed.
+      if (attemptCount === 1) return { status: 408, body: 'timeout' };
+      if (attemptCount === 2) return { status: 429, body: 'rate limited' };
+      return { status: 200 };
+    });
+
+    webhooks = createWebhooks({
+      dbPath: join(tmpDir, 'w.db'),
+      signingSecret: 'shh',
+      maxAttempts: 5,
+      baseRetryDelayMs: 20,
+      maxRetryDelayMs: 50,
+      pollIntervalMs: 20,
+    });
+    await webhooks.register('order.created', `http://127.0.0.1:${port}/hook`);
+    await webhooks.emit('order.created', { orderId: 1 });
+
+    await waitFor(() => received.length >= 3, 3_000);
+    expect(received).toHaveLength(3);
+    expect(await webhooks.listDead()).toHaveLength(0);
+  });
+
+  it('migrates an old database (no lease_expires_at column) on open', async () => {
+    const dbPath = join(tmpDir, 'legacy.db');
+
+    // Stand up the receiver first so we know the live port.
+    await startServer(() => ({ status: 200 }));
+
+    // Create a DB with the pre-lease schema, populate it as a previous
+    // process would have done, then close.
+    {
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE deliveries (
+          id              TEXT PRIMARY KEY,
+          event_name      TEXT NOT NULL,
+          payload         TEXT NOT NULL,
+          subscriber_id   TEXT NOT NULL,
+          url             TEXT NOT NULL,
+          status          TEXT NOT NULL CHECK (status IN ('pending','claimed','dispatching','delivered','dead')),
+          attempts        INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at INTEGER NOT NULL,
+          last_error      TEXT,
+          created_at      INTEGER NOT NULL,
+          updated_at      INTEGER NOT NULL
+        );
+        CREATE TABLE subscribers (
+          id          TEXT PRIMARY KEY,
+          event_name  TEXT NOT NULL,
+          url         TEXT NOT NULL,
+          created_at  INTEGER NOT NULL,
+          UNIQUE(event_name, url)
+        );
+      `);
+      const now = Date.now();
+      legacy
+        .prepare(
+          `INSERT INTO deliveries
+             (id, event_name, payload, subscriber_id, url, status, attempts,
+              next_attempt_at, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)`,
+        )
+        .run(
+          'legacy-row-id',
+          'order.created',
+          JSON.stringify({ legacy: true }),
+          'legacy-sub-id',
+          `http://127.0.0.1:${port}/hook`,
+          now - 1_000,
+          now,
+          now,
+        );
+      legacy.close();
+    }
+
+    // Open the DB through createWebhooks — this triggers migrate().
+    webhooks = createWebhooks({
+      dbPath,
+      signingSecret: 'shh',
+      pollIntervalMs: 30,
+    });
+
+    // The schema should now include the new column.
+    const probe = new Database(dbPath, { readonly: true });
+    const cols = probe.prepare(`PRAGMA table_info(deliveries)`).all() as Array<{
+      name: string;
+    }>;
+    probe.close();
+    expect(cols.some((c) => c.name === 'lease_expires_at')).toBe(true);
+
+    // The legacy row's data must be intact AND deliverable.
+    await waitFor(() => received.length >= 1, 2_000);
+    expect(received[0]!.body).toEqual({ legacy: true });
+    expect(received[0]!.headers['x-webhook-delivery-id']).toBe('legacy-row-id');
+  });
 });

@@ -124,18 +124,23 @@ export class Worker {
       }
 
       const text = await res.text().catch(() => '');
-      this.recordFailure(delivery, `HTTP ${res.status}: ${text.slice(0, 500)}`);
+      this.recordFailure(
+        delivery,
+        `HTTP ${res.status}: ${text.slice(0, 500)}`,
+        isPermanentStatus(res.status),
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.recordFailure(delivery, msg);
+      // Network errors, DNS failures, timeouts — all transient by definition.
+      this.recordFailure(delivery, msg, false);
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private recordFailure(delivery: Delivery, error: string): void {
+  private recordFailure(delivery: Delivery, error: string, permanent: boolean): void {
     const nextAttempt = delivery.attempts + 1;
-    const isDead = nextAttempt >= this.opts.maxAttempts;
+    const isDead = permanent || nextAttempt >= this.opts.maxAttempts;
     const delay = nextDelayMs(
       nextAttempt,
       this.opts.baseRetryDelayMs,
@@ -148,4 +153,17 @@ export class Worker {
       isDead,
     );
   }
+}
+
+/**
+ * 4xx responses (except 408 Request Timeout and 429 Too Many Requests) mean
+ * the receiver will reject every retry — there is no point burning attempts
+ * on a malformed request, an unauthorized webhook, or a dead URL. We mark
+ * dead on the first failure. 408 and 429 explicitly ask the sender to back
+ * off and retry, so we treat them as transient.
+ */
+function isPermanentStatus(status: number): boolean {
+  if (status < 400 || status >= 500) return false;
+  if (status === 408 || status === 429) return false;
+  return true;
 }
