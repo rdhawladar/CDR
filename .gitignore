@@ -1,0 +1,26 @@
+# Claude Code — personal/local
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+coverage/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*

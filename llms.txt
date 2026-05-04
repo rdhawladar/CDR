@@ -1,0 +1,56 @@
+# Claude Code Full-Stack Starter
+
+> A reusable GitHub template that bootstraps a Claude Code project with five specialist AI subagents (architect, frontend, backend, QA, code reviewer), pre-configured workflows, coding standards, and architecture documentation — built specifically for full-stack TypeScript development with Anthropic's Claude Code CLI.
+
+This template solves a common problem for developers using Claude Code: every new project requires manually setting up `CLAUDE.md`, defining subagents, writing workflow skills, and establishing coding standards. This template provides all of that as a one-click GitHub template.
+
+## What it provides
+
+- Five specialist subagents in `.claude/agents/`: architect (tech decisions, ADRs), frontend-specialist (React + TypeScript), backend-specialist (Node.js + Postgres + Zod), qa-engineer (tests + edge cases), code-reviewer (pre-merge audit)
+- A `new-feature` skill in `.claude/skills/` that orchestrates the full agent workflow
+- Pre-configured Claude Code permissions in `.claude/settings.json`
+- Architecture, product, and ADR (Architecture Decision Record) documentation scaffolding
+- TypeScript-strict coding standards enforced via `CLAUDE.md`
+
+## Who it is for
+
+- Solo developers and small teams using Claude Code for full-stack TypeScript work
+- Engineering leads establishing AI development standards
+- Consultants and agencies spinning up new client projects on a repeatable foundation
+
+## How to use it
+
+Click "Use this template" on the GitHub repository, or run:
+
+```
+gh repo create my-project --template rdhawladar/claude-code-fullstack-starter --private --clone
+```
+
+Then `cd` into the new project and run `claude`. Agents auto-load from `.claude/agents/`.
+
+## Documentation
+
+- [README](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/README.md): Full overview, setup, FAQ
+- [CLAUDE.md](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/CLAUDE.md): Project rules and coding standards
+- [Architecture](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/docs/architecture.md): Default tech stack and folder layout
+- [Product context template](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/docs/product.md)
+- [ADR template](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/docs/decisions/0001-template.md)
+
+## Subagents
+
+- [Architect](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/.claude/agents/architect.md): System design, tech selection, ADRs (uses Opus)
+- [Frontend specialist](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/.claude/agents/frontend-specialist.md): React + TypeScript, accessibility, browser testing (Sonnet)
+- [Backend specialist](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/.claude/agents/backend-specialist.md): APIs, DB, services, auth (Sonnet)
+- [QA engineer](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/.claude/agents/qa-engineer.md): Tests, edge cases, regressions (Sonnet)
+- [Code reviewer](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/.claude/agents/code-reviewer.md): Pre-merge audit (Opus)
+
+## Skills
+
+- [new-feature](https://github.com/rdhawladar/claude-code-fullstack-starter/blob/main/.claude/skills/new-feature/SKILL.md): End-to-end full-stack feature workflow
+
+## Related concepts
+
+- [Claude Code documentation (Anthropic)](https://docs.claude.com/en/docs/claude-code)
+- [Claude Code subagents guide](https://docs.claude.com/en/docs/claude-code/sub-agents)
+- [Claude Code memory and CLAUDE.md](https://docs.claude.com/en/docs/claude-code/memory)
+- [Claude Code best practices](https://www.anthropic.com/engineering/claude-code-best-practices)
