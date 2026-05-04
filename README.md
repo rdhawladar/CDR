@@ -60,11 +60,17 @@ const webhooks = createWebhooks({
   maxRetryDelayMs: 60_000,                         // default
   requestTimeoutMs: 10_000,                        // default
   pollIntervalMs: 5_000,                           // default
+  leaseMs: 60_000,                                 // default; must be > requestTimeoutMs
   autoStart: true,                                 // default
 });
 
 await webhooks.register(eventName, url);          // → { id }
 await webhooks.emit(eventName, payload);           // → { deliveryIds }
+
+// Admin / observability
+const dead = await webhooks.listDead({ limit: 100 });   // inspect dead-lettered rows
+await webhooks.requeue(deliveryId);                      // retry one manually
+
 await webhooks.close();
 ```
 
@@ -95,7 +101,12 @@ dispatching  --(non-2xx / error / timeout)-->  pending  (next_attempt_at = now +
                                               after maxAttempts -->  dead
 ```
 
-The transition `claimed → dispatching` is committed to disk **before** the HTTP request is awaited. That's the row that says *"we may already have sent this."* On boot, any row left in `claimed` or `dispatching` is reset to `pending` and retried — that's how a `kill -9` mid-fetch recovers.
+The transition `claimed → dispatching` is committed to disk **before** the HTTP request is awaited. That's the row that says *"we may already have sent this."*
+
+Two recovery mechanisms backstop this:
+
+- **Boot recovery** — on `createWebhooks()` start-up, every row left in `claimed` or `dispatching` is reset to `pending`. Handles `kill -9` mid-fetch.
+- **Lease sweep** — every claimed row carries a `lease_expires_at`. The polling tick resets any row whose lease has expired back to `pending`. Handles a worker that hangs inside a still-alive process. The lease is set to `leaseMs` (default 60 s, validated to be greater than `requestTimeoutMs` so a healthy slow fetch is never reaped).
 
 ### Dispatch (hybrid)
 

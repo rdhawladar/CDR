@@ -22,6 +22,8 @@ export type Delivery = {
   attempts: number;
   nextAttemptAt: number;
   lastError: string | null;
+  /** When the current claim expires; the per-tick sweep redrives the row past this. */
+  leaseExpiresAt: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -41,8 +43,20 @@ export type WebhooksConfig = {
   requestTimeoutMs?: number;
   /** Polling tick interval (lease sweep + retries due). Default 5_000. */
   pollIntervalMs?: number;
+  /**
+   * How long a claimed row's lease lasts. Must be > requestTimeoutMs so a
+   * healthy in-flight fetch isn't reaped. Default 60_000.
+   */
+  leaseMs?: number;
   /** Disable automatic worker start (useful for tests). Default false. */
   autoStart?: boolean;
+};
+
+export type ListDeadOptions = {
+  /** Page size. Default 100. */
+  limit?: number;
+  /** Page offset. Default 0. */
+  offset?: number;
 };
 
 export type Webhooks = {
@@ -50,6 +64,13 @@ export type Webhooks = {
   register(eventName: string, url: string): Promise<{ id: string }>;
   /** Emit an event. Returns once delivery rows are durably persisted. */
   emit(eventName: string, payload: unknown): Promise<{ deliveryIds: string[] }>;
+  /** Inspect dead-lettered deliveries (admin / observability). */
+  listDead(options?: ListDeadOptions): Promise<Delivery[]>;
+  /**
+   * Move a dead delivery back into the queue for another set of attempts.
+   * Resets the attempt counter. Returns false if the id wasn't dead.
+   */
+  requeue(deliveryId: string): Promise<{ ok: boolean }>;
   /** Manually start the dispatch worker (only needed if autoStart=false). */
   start(): void;
   /** Stop the worker and close the database. */

@@ -384,6 +384,160 @@ WEBHOOK_SECRET=this-is-wrong pnpm example:emitter
 
 ---
 
+## 9b. Manual end-to-end — admin API (`listDead` / `requeue`)
+
+Proves the operator surface for inspecting and retrying dead-lettered rows.
+
+### 9b.1 Produce a dead row
+
+Stop everything from prior sections. Clean state, then run a "always-fail" receiver to drive a row to `dead`:
+
+```bash
+find . -maxdepth 1 -name 'webhooks.db*' -delete
+FAIL_UNTIL=99 pnpm example:receiver        # terminal A
+DRAIN_MS=20000 pnpm example:emitter        # terminal B
+```
+
+Wait for the emitter to print `closed cleanly`. Confirm one row is dead:
+
+```bash
+sqlite3 webhooks.db 'SELECT id, status, attempts FROM deliveries;'
+```
+
+### 9b.2 Use `listDead()` and `requeue()` from a one-off script
+
+Create a temporary inspector script:
+
+```bash
+cat > /tmp/admin-demo.ts <<'EOF'
+import { createWebhooks } from './src/index.js';
+
+const w = createWebhooks({
+  dbPath: './webhooks.db',
+  signingSecret: 'example-secret',
+  pollIntervalMs: 500,
+  baseRetryDelayMs: 250,
+});
+
+const dead = await w.listDead();
+console.log(`[admin] dead count: ${dead.length}`);
+for (const d of dead) {
+  console.log(`  - ${d.id} attempts=${d.attempts} err=${d.lastError?.slice(0, 60)}`);
+}
+
+if (dead[0]) {
+  console.log(`[admin] requeueing ${dead[0].id}`);
+  await w.requeue(dead[0].id);
+  console.log('[admin] requeued — worker is now retrying');
+}
+
+await new Promise((r) => setTimeout(r, 5000));
+await w.close();
+EOF
+```
+
+Now flip the receiver to "always-succeed":
+
+```bash
+# kill the failing receiver
+pkill -9 -f 'examples/order-app'
+# start it in success mode
+pnpm example:receiver       # terminal A
+```
+
+Run the admin script:
+
+```bash
+pnpm exec tsx /tmp/admin-demo.ts        # terminal B
+```
+
+**Expected output in terminal B:**
+```
+[admin] dead count: 1
+  - <id> attempts=8 err=HTTP 503: temporarily failing
+[admin] requeueing <id>
+[admin] requeued — worker is now retrying
+```
+
+**Expected output in terminal A:**
+```
+[receiver] OK order.created delivery=<id> body={…}
+```
+
+**Pass criteria:**
+- `listDead()` reported the dead row from 9b.1.
+- After `requeue()`, the receiver received the row and logged OK.
+- The delivery-id matches across both terminals.
+
+### 9b.3 Cleanup
+```bash
+rm -f /tmp/admin-demo.ts
+pkill -9 -f 'examples/order-app' 2>/dev/null || true
+find . -maxdepth 1 -name 'webhooks.db*' -delete
+```
+
+---
+
+## 9c. Manual end-to-end — lease sweep (in-process redrive)
+
+Proves that a row stuck in `dispatching` inside a *still-running* process gets recovered by the polling tick (not just on the next boot).
+
+### 9c.1 Set up
+
+```bash
+find . -maxdepth 1 -name 'webhooks.db*' -delete
+pnpm example:receiver        # terminal A — succeeds
+pnpm example:emitter         # terminal B — fires one event, exits in 6 s after delivery
+```
+
+You should see one OK in terminal A.
+
+### 9c.2 Forcibly stick the row in `dispatching` with an expired lease
+
+The emitter has exited cleanly. Restart it but **do not** emit a new event — instead, manipulate the DB to put the existing delivered row back in `dispatching` with a lease in the past, then start a worker against it:
+
+```bash
+sqlite3 webhooks.db "
+  UPDATE deliveries
+  SET status = 'dispatching',
+      lease_expires_at = $(($(date +%s) - 60)) * 1000
+  WHERE 1=1;"
+```
+
+Confirm:
+```bash
+sqlite3 webhooks.db 'SELECT id, status, lease_expires_at FROM deliveries;'
+```
+
+### 9c.3 Boot a worker that runs without a fresh emit
+
+Start the emitter again — its boot triggers `recoverInflight()` which already handles this case, **but** to prove the in-process sweep we want the row to land *after* boot. Easier path: emit a new event so the worker starts polling, and the next sweep tick picks up the stuck row:
+
+```bash
+pnpm example:emitter         # terminal B
+```
+
+**Expected output in terminal A:**
+
+```
+[receiver] duplicate delivery <stuck-id> ignored (at-least-once)
+[receiver] OK order.created delivery=<new-id> body={…}
+```
+
+**Pass criteria:**
+- Two log lines in terminal A.
+- One uses the **stuck-row's id** (proves the lease sweep redrove it).
+- The other uses a **new id** (proves the new emit also delivered).
+- Receiver dedupes the stuck-row redelivery.
+
+### 9c.4 Cleanup
+```bash
+pkill -9 -f 'examples/order-app' 2>/dev/null || true
+find . -maxdepth 1 -name 'webhooks.db*' -delete
+```
+
+---
+
 ## 10. Inspect the database (reference)
 
 The state of the world lives in `./webhooks.db`. Useful queries:

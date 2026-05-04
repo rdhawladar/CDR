@@ -55,13 +55,13 @@ async function stopServer(): Promise<void> {
 }
 
 async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   timeoutMs = 5_000,
   stepMs = 25,
 ): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((r) => setTimeout(r, stepMs));
   }
   throw new Error(`waitFor timed out after ${timeoutMs}ms`);
@@ -224,5 +224,110 @@ describe('createWebhooks', () => {
     });
     await waitFor(() => received.length >= 1);
     expect(received[0]!.body).toEqual({ orderId: 99 });
+  });
+
+  it('sweeps expired leases without restarting the process', async () => {
+    // Proves the in-process redrive path: a row whose lease has expired
+    // (worker hung mid-fetch but the process is still alive) gets reset
+    // by the next polling tick and redelivered.
+    await startServer(() => ({ status: 200 }));
+    const dbPath = join(tmpDir, 'w.db');
+
+    webhooks = createWebhooks({
+      dbPath,
+      signingSecret: 'shh',
+      requestTimeoutMs: 100,
+      leaseMs: 200,
+      pollIntervalMs: 50,
+    });
+    await webhooks.register('order.created', `http://127.0.0.1:${port}/hook`);
+    const { deliveryIds } = await webhooks.emit('order.created', { orderId: 1 });
+
+    // Wait for the row to be delivered normally first, then forcibly back
+    // it up into 'dispatching' with an expired lease — same as if the
+    // current process had hung in fetch() and never written 'delivered'.
+    await waitFor(() => received.length >= 1);
+    received.length = 0;
+
+    const db = new Database(dbPath);
+    db.prepare(
+      `UPDATE deliveries
+       SET status = 'dispatching', lease_expires_at = ?, attempts = 1
+       WHERE id = ?`,
+    ).run(Date.now() - 1_000, deliveryIds[0]!);
+    db.close();
+
+    // The next poll tick should sweep the expired lease, reset to pending,
+    // and redeliver — without us touching the process.
+    await waitFor(() => received.length >= 1, 3_000);
+    expect(received[0]!.headers['x-webhook-delivery-id']).toBe(deliveryIds[0]!);
+  });
+
+  it('listDead() returns dead-lettered deliveries', async () => {
+    await startServer(() => ({ status: 500, body: 'always fails' }));
+    webhooks = createWebhooks({
+      dbPath: join(tmpDir, 'w.db'),
+      signingSecret: 'shh',
+      maxAttempts: 2,
+      baseRetryDelayMs: 10,
+      maxRetryDelayMs: 30,
+      pollIntervalMs: 20,
+    });
+    await webhooks.register('order.created', `http://127.0.0.1:${port}/hook`);
+    await webhooks.emit('order.created', { orderId: 1 });
+
+    await waitFor(() => received.length >= 2);
+    // Give the worker a moment to write the final 'dead' state.
+    await waitFor(async () => (await webhooks!.listDead()).length >= 1, 2_000);
+
+    const dead = await webhooks.listDead();
+    expect(dead).toHaveLength(1);
+    expect(dead[0]!.status).toBe('dead');
+    expect(dead[0]!.attempts).toBe(2);
+    expect(dead[0]!.lastError).toMatch(/HTTP 500/);
+  });
+
+  it('requeue() moves a dead delivery back to pending and redelivers it', async () => {
+    let succeed = false;
+    await startServer(() =>
+      succeed ? { status: 200 } : { status: 500, body: 'fail' },
+    );
+    webhooks = createWebhooks({
+      dbPath: join(tmpDir, 'w.db'),
+      signingSecret: 'shh',
+      maxAttempts: 2,
+      baseRetryDelayMs: 10,
+      maxRetryDelayMs: 30,
+      pollIntervalMs: 20,
+    });
+    await webhooks.register('order.created', `http://127.0.0.1:${port}/hook`);
+    await webhooks.emit('order.created', { orderId: 1 });
+
+    // Wait for the delivery to land in 'dead'.
+    await waitFor(async () => (await webhooks!.listDead()).length >= 1, 2_000);
+    const beforeCount = received.length;
+
+    // Now flip the receiver to "succeed" and requeue.
+    succeed = true;
+    const dead = await webhooks.listDead();
+    const result = await webhooks.requeue(dead[0]!.id);
+    expect(result.ok).toBe(true);
+
+    await waitFor(() => received.length > beforeCount, 2_000);
+    // The redelivery uses the same row, so its delivery-id matches.
+    const last = received[received.length - 1]!;
+    expect(last.headers['x-webhook-delivery-id']).toBe(dead[0]!.id);
+    expect(await webhooks.listDead()).toHaveLength(0);
+  });
+
+  it('rejects leaseMs <= requestTimeoutMs at construction', () => {
+    expect(() =>
+      createWebhooks({
+        dbPath: join(tmpDir, 'w.db'),
+        signingSecret: 'shh',
+        requestTimeoutMs: 5_000,
+        leaseMs: 1_000,
+      }),
+    ).toThrow(/leaseMs.*must be greater than requestTimeoutMs/);
   });
 });

@@ -13,19 +13,21 @@ CREATE TABLE IF NOT EXISTS subscribers (
 CREATE INDEX IF NOT EXISTS subscribers_event ON subscribers(event_name);
 
 CREATE TABLE IF NOT EXISTS deliveries (
-  id              TEXT PRIMARY KEY,
-  event_name      TEXT NOT NULL,
-  payload         TEXT NOT NULL,
-  subscriber_id   TEXT NOT NULL,
-  url             TEXT NOT NULL,
-  status          TEXT NOT NULL CHECK (status IN ('pending','claimed','dispatching','delivered','dead')),
-  attempts        INTEGER NOT NULL DEFAULT 0,
-  next_attempt_at INTEGER NOT NULL,
-  last_error      TEXT,
-  created_at      INTEGER NOT NULL,
-  updated_at      INTEGER NOT NULL
+  id               TEXT PRIMARY KEY,
+  event_name       TEXT NOT NULL,
+  payload          TEXT NOT NULL,
+  subscriber_id    TEXT NOT NULL,
+  url              TEXT NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('pending','claimed','dispatching','delivered','dead')),
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at  INTEGER NOT NULL,
+  last_error       TEXT,
+  lease_expires_at INTEGER,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS deliveries_lease ON deliveries(status, lease_expires_at);
 `;
 
 type SubscriberRow = {
@@ -45,6 +47,7 @@ type DeliveryRow = {
   attempts: number;
   next_attempt_at: number;
   last_error: string | null;
+  lease_expires_at: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -64,6 +67,7 @@ function toDelivery(r: DeliveryRow): Delivery {
     attempts: r.attempts,
     nextAttemptAt: r.next_attempt_at,
     lastError: r.last_error,
+    leaseExpiresAt: r.lease_expires_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -78,21 +82,59 @@ export class Store {
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * Idempotent forward migration. SQLite's ALTER TABLE ADD COLUMN is itself
+   * non-idempotent, so we only fire it when the column is missing.
+   */
+  private migrate(): void {
+    const cols = this.db.prepare(`PRAGMA table_info(deliveries)`).all() as Array<{
+      name: string;
+    }>;
+    if (!cols.some((c) => c.name === 'lease_expires_at')) {
+      this.db.exec(`ALTER TABLE deliveries ADD COLUMN lease_expires_at INTEGER`);
+      this.db.exec(
+        `CREATE INDEX IF NOT EXISTS deliveries_lease ON deliveries(status, lease_expires_at)`,
+      );
+    }
   }
 
   close(): void {
     this.db.close();
   }
 
-  /** Reset any rows left mid-flight by a previous process to 'pending'. */
+  /**
+   * On boot, blanket-reset any row that was claimed or dispatching when the
+   * previous process died. The lease can't be trusted across processes —
+   * we know the previous worker is gone.
+   */
   recoverInflight(now: number = Date.now()): number {
     const result = this.db
       .prepare(
         `UPDATE deliveries
-         SET status = 'pending', updated_at = ?, next_attempt_at = ?
+         SET status = 'pending', updated_at = ?, next_attempt_at = ?, lease_expires_at = NULL
          WHERE status IN ('claimed','dispatching')`,
       )
       .run(now, now);
+    return result.changes;
+  }
+
+  /**
+   * Per-tick sweep: reset any in-flight row whose lease has expired. Used by
+   * a long-running worker to recover rows whose dispatcher hung mid-fetch.
+   * Distinct from recoverInflight() — this only touches expired leases, not
+   * healthy in-progress rows.
+   */
+  sweepExpiredLeases(now: number = Date.now()): number {
+    const result = this.db
+      .prepare(
+        `UPDATE deliveries
+         SET status = 'pending', updated_at = ?, next_attempt_at = ?, lease_expires_at = NULL
+         WHERE status IN ('claimed','dispatching') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
+      )
+      .run(now, now, now);
     return result.changes;
   }
 
@@ -118,18 +160,14 @@ export class Store {
     return rows.map(toSubscriber);
   }
 
-  /**
-   * Insert one delivery row per subscriber for the given event, atomically.
-   * Returns the new delivery IDs. If there are no subscribers, returns [].
-   */
   enqueueFanout(eventName: string, payload: string, now: number = Date.now()): string[] {
     const subs = this.listSubscribers(eventName);
     if (subs.length === 0) return [];
 
     const insert = this.db.prepare(
       `INSERT INTO deliveries
-       (id, event_name, payload, subscriber_id, url, status, attempts, next_attempt_at, last_error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)`,
+       (id, event_name, payload, subscriber_id, url, status, attempts, next_attempt_at, last_error, lease_expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, ?)`,
     );
 
     const ids: string[] = [];
@@ -145,10 +183,11 @@ export class Store {
   }
 
   /**
-   * Atomically claim up to `limit` deliveries that are due. Returns the claimed rows.
-   * The conditional UPDATE prevents the same row being claimed twice.
+   * Atomically claim up to `limit` deliveries that are due. Each claimed
+   * row is stamped with a lease expiring at `now + leaseMs`. If a worker
+   * dies mid-fetch, the next sweep tick will reset the row.
    */
-  claimDue(limit: number, now: number = Date.now()): Delivery[] {
+  claimDue(limit: number, leaseMs: number, now: number = Date.now()): Delivery[] {
     const due = this.db
       .prepare(
         `SELECT id FROM deliveries
@@ -160,8 +199,10 @@ export class Store {
 
     if (due.length === 0) return [];
 
+    const leaseExpiresAt = now + leaseMs;
     const claim = this.db.prepare(
-      `UPDATE deliveries SET status = 'claimed', updated_at = ?
+      `UPDATE deliveries
+       SET status = 'claimed', updated_at = ?, lease_expires_at = ?
        WHERE id = ? AND status = 'pending'`,
     );
     const fetch = this.db.prepare(`SELECT * FROM deliveries WHERE id = ?`);
@@ -169,7 +210,7 @@ export class Store {
     const claimed: Delivery[] = [];
     const tx = this.db.transaction(() => {
       for (const { id } of due) {
-        const r = claim.run(now, id);
+        const r = claim.run(now, leaseExpiresAt, id);
         if (r.changes === 1) {
           claimed.push(toDelivery(fetch.get(id) as DeliveryRow));
         }
@@ -179,22 +220,25 @@ export class Store {
     return claimed;
   }
 
-  /** Mark a claimed row as dispatching, immediately before awaiting fetch(). */
-  markDispatching(id: string, now: number = Date.now()): void {
+  /**
+   * Mark a claimed row as dispatching, immediately before awaiting fetch().
+   * Refreshes the lease so a slow-but-healthy fetch isn't reaped by the sweeper.
+   */
+  markDispatching(id: string, leaseMs: number, now: number = Date.now()): void {
     this.db
       .prepare(
         `UPDATE deliveries
-         SET status = 'dispatching', attempts = attempts + 1, updated_at = ?
+         SET status = 'dispatching', attempts = attempts + 1, updated_at = ?, lease_expires_at = ?
          WHERE id = ? AND status = 'claimed'`,
       )
-      .run(now, id);
+      .run(now, now + leaseMs, id);
   }
 
   markDelivered(id: string, now: number = Date.now()): void {
     this.db
       .prepare(
         `UPDATE deliveries
-         SET status = 'delivered', last_error = NULL, updated_at = ?
+         SET status = 'delivered', last_error = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE id = ?`,
       )
       .run(now, id);
@@ -211,7 +255,7 @@ export class Store {
     this.db
       .prepare(
         `UPDATE deliveries
-         SET status = ?, last_error = ?, next_attempt_at = ?, updated_at = ?
+         SET status = ?, last_error = ?, next_attempt_at = ?, lease_expires_at = NULL, updated_at = ?
          WHERE id = ?`,
       )
       .run(isDead ? 'dead' : 'pending', error, nextAttemptAt, now, id);
@@ -229,5 +273,35 @@ export class Store {
       | DeliveryRow
       | undefined;
     return row ? toDelivery(row) : null;
+  }
+
+  /** List dead-lettered deliveries, newest first. */
+  listDead(limit: number, offset: number): Delivery[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM deliveries
+         WHERE status = 'dead'
+         ORDER BY updated_at DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(limit, offset) as DeliveryRow[];
+    return rows.map(toDelivery);
+  }
+
+  /**
+   * Move a dead row back to pending so it can be retried by the worker.
+   * Resets the attempt counter — the operator is explicitly asking for a
+   * fresh shot. Returns true iff a row was actually requeued.
+   */
+  requeue(id: string, now: number = Date.now()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE deliveries
+         SET status = 'pending', attempts = 0, last_error = NULL,
+             lease_expires_at = NULL, next_attempt_at = ?, updated_at = ?
+         WHERE id = ? AND status = 'dead'`,
+      )
+      .run(now, now, id);
+    return result.changes === 1;
   }
 }

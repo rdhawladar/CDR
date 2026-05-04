@@ -11,6 +11,8 @@ type WorkerOptions = {
   maxRetryDelayMs: number;
   requestTimeoutMs: number;
   pollIntervalMs: number;
+  /** Lease length for claimed rows. Must be > requestTimeoutMs. */
+  leaseMs: number;
   /** Injected for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
 };
@@ -36,6 +38,7 @@ export class Worker {
   start(): void {
     if (this.timer) return;
     this.stopped = false;
+    // Boot recovery: previous process is gone, blanket-reset its in-flight rows.
     this.opts.store.recoverInflight();
     this.timer = setInterval(() => this.wakeup(), this.opts.pollIntervalMs);
     // Allow the process to exit naturally even if the worker is idle.
@@ -70,19 +73,20 @@ export class Worker {
     if (this.stopped || this.draining) return;
     this.draining = true;
     try {
+      // Per-tick: redrive any in-flight row whose lease expired (a worker
+      // hung mid-fetch in this same process). Boot recovery handles the
+      // crashed-process case; this handles the still-alive-but-stuck case.
+      this.opts.store.sweepExpiredLeases();
+
       // Drain in waves so a long subscriber doesn't starve newer events.
       for (let i = 0; i < 3; i++) {
         if (this.stopped) break;
-        const batch = this.opts.store.claimDue(BATCH_SIZE);
+        const batch = this.opts.store.claimDue(BATCH_SIZE, this.opts.leaseMs);
         if (batch.length === 0) break;
         await Promise.allSettled(batch.map((d) => this.dispatch(d)));
       }
     } finally {
       this.draining = false;
-    }
-    // If more work just landed, pick it up.
-    if (!this.stopped && this.opts.store.claimDue(0).length === 0) {
-      // no-op; intentionally cheap probe
     }
   }
 
@@ -90,7 +94,8 @@ export class Worker {
     if (this.stopped) return;
     // Critical: write 'dispatching' to disk BEFORE awaiting the network
     // request, so a crash mid-fetch is recoverable on next boot.
-    this.opts.store.markDispatching(delivery.id);
+    // Refreshes the lease so a slow-but-healthy fetch isn't reaped.
+    this.opts.store.markDispatching(delivery.id, this.opts.leaseMs);
 
     const timestamp = String(Date.now());
     const body = delivery.payload;
