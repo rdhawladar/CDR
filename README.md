@@ -89,16 +89,59 @@ Outgoing requests carry these headers:
 
 ## How delivery works
 
+### Architecture at a glance
+
+The library is a single process boundary: your application code, the public API, the worker, and the SQLite file all live in **one Node.js process**. Subscribers are the only external systems.
+
+```mermaid
+flowchart LR
+    App["Your Node.js<br/>application"]
+
+    subgraph Library["@cdr/webhooks &nbsp;(in-process)"]
+        direction TB
+        API["Public API<br/><br/>register · emit<br/>listDead · requeue"]
+        Worker["Worker<br/><br/>setImmediate wakeup<br/>5 s polling fallback<br/>lease sweep<br/>backoff + retry"]
+        Store[("SQLite<br/>./webhooks.db<br/><br/>subscribers<br/>deliveries")]
+    end
+
+    SubA["Subscriber A<br/>https://…"]
+    SubB["Subscriber B<br/>https://…"]
+
+    App -- "register / emit" --> API
+    API -- "INSERT &nbsp;~1 ms" --> Store
+    API -. "setImmediate wakeup" .-> Worker
+    Worker -- "claim · markDispatching<br/>markDelivered · markFailed" --> Store
+    Store -- "due rows + leases" --> Worker
+    Worker -- "POST + HMAC<br/>(retries on failure)" --> SubA
+    Worker -- "POST + HMAC<br/>(retries on failure)" --> SubB
+```
+
+Two key things to read off this picture:
+
+1. **`emit()` only touches the local SQLite file.** The dotted arrow to the worker is a `setImmediate` nudge — it doesn't await any network. That's why `emit()` returns in ~1 ms regardless of subscriber latency.
+2. **The worker is the only thing that talks to subscribers.** Retries, backoff, and lease-sweep recovery all happen behind that boundary. The application never sees a failed delivery on its hot path.
+
 ### State machine
 
 Each `(event, subscriber)` pair becomes one row in `deliveries`. The row moves through:
 
-```
-pending  --(worker claims)-->  claimed
-claimed  --(write before await fetch)-->  dispatching
-dispatching  --(2xx response)-->  delivered
-dispatching  --(non-2xx / error / timeout)-->  pending  (next_attempt_at = now + backoff)
-                                              after maxAttempts -->  dead
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> pending: emit()
+    pending --> claimed: worker claims<br/>+ lease set
+    claimed --> dispatching: write BEFORE<br/>await fetch
+    dispatching --> delivered: 2xx response
+    dispatching --> pending: non-2xx / error / timeout<br/>(retry after backoff)
+    pending --> dead: attempts ≥ maxAttempts
+    dead --> pending: requeue() (manual)
+    delivered --> [*]
+
+    note right of dispatching
+        On crash here we will redeliver.
+        Receiver dedupes via
+        x-webhook-delivery-id.
+    end note
 ```
 
 The transition `claimed → dispatching` is committed to disk **before** the HTTP request is awaited. That's the row that says *"we may already have sent this."*
