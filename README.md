@@ -23,6 +23,8 @@ pnpm test         # 6 tests; ~600 ms
 pnpm typecheck
 ```
 
+> **For QA:** a step-by-step manual test plan with expected output for every guarantee — see [`docs/manual-test-plan.md`](docs/manual-test-plan.md).
+
 ### Run the example app
 
 Two terminals.
