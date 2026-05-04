@@ -4,53 +4,48 @@ The *why* behind this project. Architecture lives in `architecture.md`; this fil
 
 ## Problem
 
-What problem does this product solve? Who is hurting today, and how?
+Node.js applications routinely need to notify external systems when business events occur (e.g. `order.created`, `user.signed_up`). Rolling delivery yourself is deceptively hard: a subscriber that's slow or down must not block the caller, and a process crash must not silently drop pending or in-flight webhooks. Most teams either reach for a heavyweight queue (Redis + BullMQ + an ops surface) or build a fragile in-memory loop that loses messages on restart.
 
-> _Replace this with 2–4 sentences describing the user pain in concrete terms._
+We're building an embeddable TypeScript library that gives any Node.js app reliable webhook delivery with **zero external infrastructure** — durable, async, with retries — through a 3-line API.
 
 ## Users
 
-Who uses this? Be specific — roles, not demographics.
-
-- **Primary:** _e.g. solo founders managing customer support_
-- **Secondary:** _e.g. their first support hire_
-- **Not for:** _e.g. enterprises with existing Zendesk_
+- **Primary:** TypeScript/Node.js backend developers building small-to-medium apps who want reliable webhook delivery without standing up a queue.
+- **Secondary:** Reviewers evaluating this take-home assignment for engineering judgment, code quality, and clarity of tradeoffs.
+- **Not for:** High-throughput systems (>10k events/min) — those should use a real broker (Kafka/SQS/BullMQ).
 
 ## What Success Looks Like
 
-How do we know the product is working? Pick metrics, not vibes.
-
-- _e.g. user resolves their first ticket within 5 minutes of signup_
-- _e.g. 60% of weekly actives return the following week_
+- A developer can integrate the library in under 5 minutes following the README.
+- `emit()` returns in <10 ms regardless of subscriber latency.
+- A `kill -9` on the host process loses zero acknowledged events on restart.
+- The example app demonstrates registration, emission, retry on subscriber failure, and restart recovery.
+- README clearly states delivery guarantees (at-least-once, durable, decoupled) and one honest tradeoff.
 
 ## Core Use Cases
 
-The two or three flows the product must nail. Everything else is secondary.
-
-1. _e.g. import existing tickets from Gmail and triage them_
-2. _e.g. draft a reply with full customer history in context_
-3. _e.g. hand off to a human when confidence is low_
+1. **Register a subscriber** — `webhooks.register('order.created', 'https://...')` persists the URL against an event type.
+2. **Emit an event** — `webhooks.emit('order.created', payload)` returns immediately; the library fans out to all registered subscribers asynchronously with retries.
+3. **Recover from crashes** — on restart, the library picks up any pending or in-flight deliveries and resumes work.
 
 ## Non-Goals
 
-What we are explicitly **not** building. Just as important as what we are.
-
-- _e.g. no real-time chat — async only_
-- _e.g. no mobile app in v1_
-- _e.g. no multi-language support until US/UK product is solid_
+- No subscriber management UI / admin dashboard.
+- No exactly-once delivery — at-least-once with HMAC + idempotency hint is the contract.
+- No multi-tenant routing or per-subscriber rate limits in v1.
+- No distributed worker pool — single-process worker only (a follow-up tradeoff in the README).
+- No web UI for inspecting dead-letter rows in v1.
 
 ## Constraints
 
-External pressures that shape decisions.
-
-- **Deadline:** _e.g. private beta by end of Q3_
-- **Budget:** _e.g. infra under $200/mo until 100 paying users_
-- **Compliance:** _e.g. SOC 2 required before enterprise tier_
-- **Team:** _e.g. one full-stack dev + one designer_
+- **Deadline:** 2-hour total build time (take-home assignment).
+- **Deliverables:** working library + example app + README + GitHub URL.
+- **Stack:** TypeScript strict mode, pnpm, project conventions in `CLAUDE.md`.
+- **Process:** document prompts and decisions for the follow-up interview.
+- **Infra budget:** zero — must run with `pnpm install && pnpm start` and no external services.
 
 ## Open Questions
 
-Things we haven't decided yet — review periodically and either answer or delete.
-
-- _e.g. pricing model: per-seat vs per-ticket?_
-- _e.g. self-hosted option for enterprise?_
+- Should the library expose a way to inspect dead-lettered events programmatically? (Probably yes — minimal API, defer admin UI.)
+- Do we ship the SQLite path as configurable, or hard-code `./webhooks.db`? (Configurable wins for ~5 lines of code.)
+- HMAC signing on by default, or opt-in via config? (Default on, with a shared secret in config.)

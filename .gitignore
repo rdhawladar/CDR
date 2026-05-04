@@ -24,3 +24,9 @@ coverage/
 *.log
 npm-debug.log*
 pnpm-debug.log*
+
+# Webhook library local DBs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
